@@ -177,7 +177,9 @@ using PointersAndHasReadsOutsideSet =
 static SmallVector<PointersAndHasReadsOutsideSet, 0> collectPromotionCandidates(
     MemorySSA *MSSA, AliasAnalysis *AA, DominatorTree *DT,
     ICFLoopSafetyInfo *SafetyInfo,
-    const SmallPtrSetImpl<const MDNode *> &LoopLocalAliasScopes, Loop *L);
+    const SmallPtrSetImpl<const MDNode *> &LoopLocalAliasScopes, Loop *L,
+    bool PromoteAliasingAccesses,
+    SmallPtrSetImpl<Value *> &PointersWithAliasingAccesses);
 
 namespace {
 struct LoopInvariantCodeMotion {
@@ -481,13 +483,16 @@ bool LoopInvariantCodeMotion::runOnLoop(Loop *L, const LICMDependencies &Deps,
           MSSAInsertPts.push_back(nullptr);
         }
 
+        SmallPtrSet<Value *, 8> PointersWithAliasingAccesses;
         for (auto [PointerMustAliases, HasReadsOutsideSet] :
              collectPromotionCandidates(MSSA, &Deps.AA, &Deps.DT,
                                         &Deps.SafetyInfo, LoopLocalAliasScopes,
-                                        L)) {
+                                        L, Opts.licm_promote_aliasing_accesses,
+                                        PointersWithAliasingAccesses)) {
           LocalPromoted |= promoteLoopAccessesToScalars(
               PointerMustAliases, ExitBlocks, InsertPts, MSSAInsertPts, PIC,
-              Deps, L, LicmAllowSpeculation, HasReadsOutsideSet);
+              Deps, L, LicmAllowSpeculation, HasReadsOutsideSet,
+              PointersWithAliasingAccesses);
         }
         Promoted |= LocalPromoted;
       } while (LocalPromoted);
@@ -1490,6 +1495,257 @@ static bool isSafeToExecuteUnconditionally(
   return GuaranteedToExecute;
 }
 
+//===----------------------------------------------------------------------===//
+// Promotion of locations that have an aliasing reduction access
+//===----------------------------------------------------------------------===//
+//
+// Promotion normally discards a must-alias set as soon as some other
+// instruction in the loop may write to it. That is stricter than necessary when
+// the aliasing access is itself a reduction of the same shape, as in
+//
+//   for (i) { a[k] += x[i]; b[k] += y[i]; }
+//
+// where a and b may be the same object. Every location involved is read and
+// written exactly once per iteration by an operation that reassociates, so the
+// two accumulations commute. The promoted location can therefore accumulate
+// into a register starting from the identity element and be merged back into
+// memory once, in the loop exit blocks, instead of on every iteration.
+//
+// Collecting the candidates is split across mustDiscardCandidate() and
+// filterCandidatesWithAliasingReads(); the rewrite is
+// LoopPromoter::fixAliasingStore().
+
+/// Walk forward from \p V to the loads of and the stores to the location it
+/// designates. Stops at anything that may write memory other than a plain
+/// store, so that the collected sets are exact rather than approximate.
+static void gatherLoadsAndStores(Value *V, SmallPtrSetImpl<Value *> &Visited,
+                                 SmallPtrSetImpl<LoadInst *> &Loads,
+                                 SmallPtrSetImpl<StoreInst *> &Stores) {
+  if (!Visited.insert(V).second)
+    return;
+
+  if (auto *I = dyn_cast<Instruction>(V)) {
+    if (auto *SI = dyn_cast<StoreInst>(I)) {
+      Stores.insert(SI);
+      return;
+    }
+    if (auto *LI = dyn_cast<LoadInst>(I))
+      Loads.insert(LI);
+    if (isa<PHINode>(I) || isa<CallInst>(I) || I->mayWriteToMemory())
+      return;
+  }
+
+  for (User *U : V->users())
+    if (!isa<DbgInfoIntrinsic>(U))
+      gatherLoadsAndStores(U, Visited, Loads, Stores);
+}
+
+/// If the location designated by \p Ptr is read exactly once and written
+/// exactly once through that same pointer, return the load/store pair.
+/// Otherwise return a pair of null pointers.
+static std::pair<LoadInst *, StoreInst *> getUniqueLoadStore(Value *Ptr) {
+  if (!Ptr)
+    return {nullptr, nullptr};
+
+  SmallPtrSet<Value *, 8> Visited;
+  SmallPtrSet<LoadInst *, 8> Loads;
+  SmallPtrSet<StoreInst *, 8> Stores;
+  gatherLoadsAndStores(Ptr, Visited, Loads, Stores);
+
+  if (Loads.size() != 1 || Stores.size() != 1)
+    return {nullptr, nullptr};
+
+  LoadInst *LI = *Loads.begin();
+  StoreInst *SI = *Stores.begin();
+  if (LI->getPointerOperand() != SI->getPointerOperand())
+    return {nullptr, nullptr};
+  return {LI, SI};
+}
+
+/// Return the binary operator that first consumes \p I, looking through bitcast
+/// chains and phis.
+static BinaryOperator *getFirstBinaryUse(Instruction *I, unsigned Depth = 0) {
+  // Phis can form cycles, so bound the search.
+  if (Depth > 4)
+    return nullptr;
+
+  while (auto *BC = dyn_cast<BitCastInst>(I)) {
+    I = dyn_cast<Instruction>(BC->getOperand(0));
+    if (!I)
+      return nullptr;
+  }
+
+  for (User *U : I->users()) {
+    if (isa<PHINode>(U))
+      continue;
+    return dyn_cast<BinaryOperator>(U);
+  }
+
+  // Every use is a phi. Follow a single one through to the reduction.
+  if (I->hasOneUse())
+    if (auto *PN = dyn_cast<PHINode>(*I->user_begin()))
+      return getFirstBinaryUse(PN, Depth + 1);
+  return nullptr;
+}
+
+/// Return true if the partial results of a reduction built out of \p BO can be
+/// combined in a different order than the loop computes them. Integer
+/// arithmetic always can; floating point needs the reassociation fast-math
+/// flag, since the rewrite changes the order of the accumulation.
+static bool isReassociableReduction(const BinaryOperator *BO) {
+  switch (BO->getOpcode()) {
+  case Instruction::Add:
+  case Instruction::Sub:
+  case Instruction::Mul:
+    return true;
+  case Instruction::FAdd:
+  case Instruction::FSub:
+  case Instruction::FMul:
+    return BO->hasAllowReassoc();
+  default:
+    return false;
+  }
+}
+
+/// Return the operator that merges a partial accumulation built with \p Opc
+/// back into the original value. A subtraction accumulates negated partials, so
+/// it is merged with an addition.
+static Instruction::BinaryOps
+getReductionMergeOpcode(Instruction::BinaryOps Opc) {
+  switch (Opc) {
+  case Instruction::Sub:
+    return Instruction::Add;
+  case Instruction::FSub:
+    return Instruction::FAdd;
+  default:
+    return Opc;
+  }
+}
+
+/// Return the reduction operator \p LI feeds, if \p LI is the load half of a
+/// reduction whose partial results can be reordered.
+static BinaryOperator *getReassociableReduction(LoadInst *LI) {
+  BinaryOperator *BO = getFirstBinaryUse(LI);
+  if (!BO || !isReassociableReduction(BO))
+    return nullptr;
+  return BO;
+}
+
+/// Return true if \p LHS and \p RHS are the load halves of reductions that use
+/// the same reorderable operator.
+static bool isSameReduction(LoadInst *LHS, LoadInst *RHS) {
+  BinaryOperator *BLHS = getReassociableReduction(LHS);
+  BinaryOperator *BRHS = getReassociableReduction(RHS);
+  return BLHS && BRHS && BLHS->getOpcode() == BRHS->getOpcode();
+}
+
+/// Return true if \p I accesses the same underlying object as some member of
+/// \p AS.
+static bool hasCommonBasePointer(Instruction *I, const AliasSet *AS) {
+  Value *Addr = getLoadStorePointerOperand(I);
+  if (!Addr)
+    return false;
+
+  const Value *Base = getUnderlyingObject(Addr);
+  for (const auto &MemLoc : *AS)
+    if (getUnderlyingObject(MemLoc.Ptr) == Base)
+      return true;
+  return false;
+}
+
+/// \p I is an instruction in \p L that may write to the must-alias set \p AS
+/// but is not itself a promotion candidate. Return true if \p AS has to be
+/// discarded, which is what promotion does by default.
+///
+/// Return false only if \p I and every member of \p AS are reductions that use
+/// the same reorderable operator, in which case the members of \p AS are added
+/// to \p PointersWithAliasingAccesses to record that they need the exit block
+/// rewrite in LoopPromoter::fixAliasingStore().
+static bool
+mustDiscardCandidate(Instruction *I, const AliasSet *AS, Loop *L,
+                     const SmallPtrSetImpl<Value *> &AttemptingPromotion,
+                     SmallPtrSetImpl<Value *> &PointersWithAliasingAccesses) {
+  // The aliasing access itself has to be a reduction over a location that is
+  // read and written exactly once.
+  auto [LI, SI] = getUniqueLoadStore(getLoadStorePointerOperand(I));
+  if (!LI || !SI || !L->contains(LI) || !L->contains(SI))
+    return true;
+
+  // Only record the members once the whole set has been proven, so that a set
+  // we end up discarding leaves nothing behind.
+  SmallVector<Value *, 8> Candidates;
+  for (const auto &MemLoc : *AS) {
+    Value *Ptr = const_cast<Value *>(MemLoc.Ptr);
+    auto [MemLI, MemSI] = getUniqueLoadStore(Ptr);
+    if (!MemLI || !MemSI)
+      return true;
+
+    // This member is the aliasing access itself.
+    if (MemLI == I || MemSI == I)
+      continue;
+
+    // The load has to feed the reduction and nothing else, both accesses have
+    // to be in the loop, and the reduction has to match the aliasing one.
+    if (!MemLI->hasOneUse() || !L->contains(MemLI) || !L->contains(MemSI) ||
+        !isSameReduction(MemLI, LI)) {
+      LLVM_DEBUG(dbgs() << "LICM: Not promoting with aliasing accesses, "
+                           "inconsistent reductions\n");
+      return true;
+    }
+
+    // Promotion rewrites the accesses of this member, so it has to be one of
+    // the accesses we are promoting.
+    if (!AttemptingPromotion.contains(MemLI))
+      return true;
+
+    Candidates.push_back(Ptr);
+  }
+
+  if (Candidates.empty())
+    return true;
+
+  PointersWithAliasingAccesses.insert_range(Candidates);
+  return false;
+}
+
+/// A location promoted despite an aliasing access is only written back in the
+/// loop exit blocks, so any other read of it inside the loop would observe a
+/// stale value. Discard the sets for which that can happen.
+static void filterCandidatesWithAliasingReads(
+    MemorySSA *MSSA, Loop *L, BatchAAResults &BatchAA,
+    SmallVectorImpl<PointerIntPair<const AliasSet *, 1, bool>> &Sets,
+    const SmallPtrSetImpl<Value *> &AttemptingPromotion,
+    const SmallPtrSetImpl<Value *> &PointersWithAliasingAccesses) {
+  if (PointersWithAliasingAccesses.empty())
+    return;
+
+  foreachMemoryAccess(MSSA, L, [&](Instruction *I) {
+    if (AttemptingPromotion.contains(I))
+      return;
+
+    llvm::erase_if(Sets, [&](PointerIntPair<const AliasSet *, 1, bool> &Pair) {
+      const AliasSet *AS = Pair.getPointer();
+      if (!isRefSet(AS->aliasesUnknownInst(I, BatchAA)))
+        return false;
+
+      for (const auto &MemLoc : *AS) {
+        if (!PointersWithAliasingAccesses.contains(
+                const_cast<Value *>(MemLoc.Ptr)))
+          continue;
+
+        // The read is tolerable only if it is itself one half of a reduction
+        // over the same object, which the exit block rewrite accounts for.
+        if (!hasCommonBasePointer(I, AS))
+          return true;
+        auto [LI, SI] = getUniqueLoadStore(getLoadStorePointerOperand(I));
+        if (!LI || !SI)
+          return true;
+      }
+      return false;
+    });
+  });
+}
+
 namespace {
 class LoopPromoter : public LoadAndStorePromoter {
   Value *SomePtr; // Designated pointer to store to.
@@ -1506,6 +1762,7 @@ class LoopPromoter : public LoadAndStorePromoter {
   ICFLoopSafetyInfo &SafetyInfo;
   bool CanInsertStoresInExitBlocks;
   ArrayRef<const Instruction *> Uses;
+  SmallVector<StoreInst *, 4> NewSIs;
 
   // We're about to add a use of V in a loop exit block.  Insert an LCSSA phi
   // (if legal) if doing so would add an out-of-loop use to an instruction
@@ -1587,6 +1844,76 @@ public:
       MSSAInsertPts[i] = NewMemAcc;
       MSSAU.insertDef(cast<MemoryDef>(NewMemAcc), true);
       // FIXME: true for safety, false may still be correct.
+      NewSIs.push_back(NewSI);
+    }
+  }
+
+  /// Rewrite a promoted reduction so that the location is merged back into
+  /// memory in the loop exit blocks rather than written on every iteration.
+  /// This is what makes promotion legal when another access in the loop may
+  /// write the same location, see mustDiscardCandidate().
+  ///
+  /// The accumulation starts from the identity element instead of the promoted
+  /// load, so that nothing of the original value is carried in the register,
+  /// and the exit block reloads the location to combine the two:
+  ///
+  ///   body: %red  = phi [ %p.promoted, %preheader ], [ %next, %latch ]
+  ///         %next = add %red, %x
+  ///   exit: store %next, ptr %p
+  ///
+  /// becomes
+  ///
+  ///   body: %red  = phi [ 0, %preheader ], [ %next, %latch ]
+  ///         %next = add %red, %x
+  ///   exit: %p.reload = load ptr %p
+  ///         %p.merged = add %p.reload, %next
+  ///         store %p.merged, ptr %p
+  ///
+  /// The preconditions are established by mustDiscardCandidate() and
+  /// re-checked in promoteLoopAccessesToScalars() before any IR is modified,
+  /// because this rewrite cannot be backed out once promotion has run.
+  void fixAliasingStore(LoadInst *PreheaderLoad) {
+    assert(PreheaderLoad->hasOneUse() && "Not a promoted reduction");
+    auto *Phi = cast<PHINode>(*PreheaderLoad->user_begin());
+    BinaryOperator *BO = getFirstBinaryUse(Phi);
+    assert(BO && isReassociableReduction(BO) && "Not a promoted reduction");
+
+    Instruction::BinaryOps MergeOpc = getReductionMergeOpcode(BO->getOpcode());
+
+    // Drop the original value from the in-loop accumulation.
+    Phi->setIncomingValueForBlock(
+        PreheaderLoad->getParent(),
+        ConstantExpr::getBinOpIdentity(MergeOpc, BO->getType()));
+
+    Type *AccessTy = PreheaderLoad->getType();
+    for (StoreInst *SI : NewSIs) {
+      Value *Partial = SI->getValueOperand();
+      Value *Ptr = SI->getPointerOperand();
+
+      LoadInst *Reload = new LoadInst(
+          AccessTy, Ptr, SomePtr->getName() + ".reload", SI->getIterator());
+      if (UnorderedAtomic)
+        Reload->setOrdering(AtomicOrdering::Unordered);
+      Reload->setAlignment(Alignment);
+      Reload->setDebugLoc(DL);
+      if (AATags)
+        Reload->setAAMetadata(AATags);
+
+      auto *StoreAcc =
+          cast<MemoryUseOrDef>(MSSAU.getMemorySSA()->getMemoryAccess(SI));
+      auto *ReloadAcc = cast<MemoryUse>(
+          MSSAU.createMemoryAccessBefore(Reload, nullptr, StoreAcc));
+      MSSAU.insertUse(ReloadAcc, /*RenameUses=*/true);
+
+      // Reassociating the accumulation can invalidate nsw/nuw, so the merge
+      // only inherits the fast-math flags.
+      auto *Merge = BinaryOperator::Create(MergeOpc, Reload, Partial,
+                                           SomePtr->getName() + ".merged",
+                                           SI->getIterator());
+      if (isa<FPMathOperator>(Merge))
+        Merge->setFastMathFlags(BO->getFastMathFlags());
+      Merge->setDebugLoc(DL);
+      SI->setOperand(0, Merge);
     }
   }
 
@@ -1656,7 +1983,8 @@ bool llvm::promoteLoopAccessesToScalars(
     SmallVectorImpl<BasicBlock::iterator> &InsertPts,
     SmallVectorImpl<MemoryAccess *> &MSSAInsertPts, PredIteratorCache &PIC,
     const LICMDependencies &Deps, Loop *CurLoop, bool AllowSpeculation,
-    bool HasReadsOutsideSet) {
+    bool HasReadsOutsideSet,
+    const SmallPtrSetImpl<Value *> &PointersWithAliasingAccesses) {
   // Verify inputs.
   assert(CurLoop != nullptr &&
          "Unexpected Input to promoteLoopAccessesToScalars");
@@ -1732,9 +2060,27 @@ bool llvm::promoteLoopAccessesToScalars(
 
   const DataLayout &MDL = Preheader->getDataLayout();
 
+  // This set was kept even though another access in the loop may write it,
+  // because both are the same reduction. Re-check the shape of this location
+  // before touching any IR: LoopPromoter::fixAliasingStore() has to run once
+  // promotion has, and it cannot be backed out.
+  bool WithAliasingAccesses = any_of(PointerMustAliases, [&](Value *Ptr) {
+    return PointersWithAliasingAccesses.contains(Ptr);
+  });
+  if (WithAliasingAccesses) {
+    auto [LI, SI] = getUniqueLoadStore(SomePtr);
+    if (!LI || !SI || !getReassociableReduction(LI)) {
+      LLVM_DEBUG(dbgs() << "Not promoting: aliasing access, but the location "
+                           "is not a reorderable reduction\n");
+      return false;
+    }
+  }
+
   // If there are reads outside the promoted set, then promoting stores is
-  // definitely not safe.
-  if (HasReadsOutsideSet)
+  // definitely not safe. A location with an aliasing reduction access is the
+  // exception: collectPromotionCandidates() has already proven that every read
+  // of it in the loop is part of the same reduction.
+  if (HasReadsOutsideSet && !WithAliasingAccesses)
     StoreSafety = StoreUnsafe;
 
   if (StoreSafety == StoreSafetyUnknown && Deps.SafetyInfo.anyBlockMayThrow()) {
@@ -1898,6 +2244,15 @@ bool llvm::promoteLoopAccessesToScalars(
     // If we cannot hoist the load either, give up.
     return false;
 
+  // Promoting the load alone is not an option here: this set was only kept
+  // because the aliasing access accumulates into the same location, and that
+  // reasoning depends on writing our partial result back in the exit blocks.
+  if (WithAliasingAccesses && StoreSafety != StoreSafe) {
+    LLVM_DEBUG(dbgs() << "Not promoting: aliasing access, but the store "
+                         "cannot be sunk to the loop exits\n");
+    return false;
+  }
+
   // Lets do the promotion!
   if (StoreSafety == StoreSafe) {
     LLVM_DEBUG(dbgs() << "LICM: Promoting load/store of the value: " << *SomePtr
@@ -1958,6 +2313,11 @@ bool llvm::promoteLoopAccessesToScalars(
   // Rewrite all the loads in the loop and remember all the definitions from
   // stores in the loop.
   Promoter.run(LoopUses);
+
+  if (WithAliasingAccesses) {
+    assert(PreheaderLoad && "Reduction promotion requires a promoted load");
+    Promoter.fixAliasingStore(PreheaderLoad);
+  }
 
   if (VerifyMemorySSA)
     Deps.MSSAU.getMemorySSA()->verifyMemorySSA();
@@ -2051,7 +2411,9 @@ static SmallPtrSet<const StoreInst *, 8> collectStoresWithInvariantAATags(
 static SmallVector<PointersAndHasReadsOutsideSet, 0> collectPromotionCandidates(
     MemorySSA *MSSA, AliasAnalysis *AA, DominatorTree *DT,
     ICFLoopSafetyInfo *SafetyInfo,
-    const SmallPtrSetImpl<const MDNode *> &LoopLocalAliasScopes, Loop *L) {
+    const SmallPtrSetImpl<const MDNode *> &LoopLocalAliasScopes, Loop *L,
+    bool PromoteAliasingAccesses,
+    SmallPtrSetImpl<Value *> &PointersWithAliasingAccesses) {
   BatchAAResults BatchAA(*AA);
   AliasSetTracker AST(BatchAA);
 
@@ -2102,9 +2464,15 @@ static SmallVector<PointersAndHasReadsOutsideSet, 0> collectPromotionCandidates(
 
     llvm::erase_if(Sets, [&](PointerIntPair<const AliasSet *, 1, bool> &Pair) {
       ModRefInfo MR = Pair.getPointer()->aliasesUnknownInst(I, BatchAA);
-      // Cannot promote if there are writes outside the set.
-      if (isModSet(MR))
-        return true;
+      // Cannot promote if there are writes outside the set, unless the write
+      // is part of the same reduction as the accesses we are promoting.
+      if (isModSet(MR)) {
+        if (!PromoteAliasingAccesses || !L->isInnermost())
+          return true;
+        return mustDiscardCandidate(I, Pair.getPointer(), L,
+                                    AttemptingPromotion,
+                                    PointersWithAliasingAccesses);
+      }
       if (isRefSet(MR)) {
         // Remember reads outside the set.
         Pair.setInt(true);
@@ -2115,6 +2483,12 @@ static SmallVector<PointersAndHasReadsOutsideSet, 0> collectPromotionCandidates(
       return false;
     });
   });
+
+  if (Sets.empty())
+    return {}; // Nothing to promote...
+
+  filterCandidatesWithAliasingReads(MSSA, L, BatchAA, Sets, AttemptingPromotion,
+                                    PointersWithAliasingAccesses);
 
   SmallVector<std::pair<SmallSetVector<Value *, 8>, bool>, 0> Result;
   for (auto [Set, HasReadsOutsideSet] : Sets) {

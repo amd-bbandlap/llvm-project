@@ -230,11 +230,16 @@ LLVM_ABI void breakLoopBackedge(Loop *L, DominatorTree &DT, ScalarEvolution &SE,
 /// Diagnostics is emitted via LICMDependencies::ORE. It returns changed status.
 /// \p AllowSpeculation is whether values should be hoisted even if they are not
 /// guaranteed to execute in the loop, but are safe to speculatively execute.
+/// \p PointersWithAliasingAccesses holds the locations that may only be
+/// promoted by accumulating into the identity element and merging the result
+/// back into memory in the loop exit blocks, because another access in the loop
+/// writes the same location through a matching reduction.
 LLVM_ABI bool promoteLoopAccessesToScalars(
     const SmallSetVector<Value *, 8> &, SmallVectorImpl<BasicBlock *> &,
     SmallVectorImpl<BasicBlock::iterator> &, SmallVectorImpl<MemoryAccess *> &,
     PredIteratorCache &, const LICMDependencies &, Loop *,
-    bool AllowSpeculation, bool HasReadsOutsideSet);
+    bool AllowSpeculation, bool HasReadsOutsideSet,
+    const SmallPtrSetImpl<Value *> &PointersWithAliasingAccesses);
 
 /// Does a BFS from a given node to all of its children inside a given loop.
 /// The returned vector of basic blocks includes the starting point.
